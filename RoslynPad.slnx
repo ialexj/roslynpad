@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RoslynPad.Cli/RoslynPad.Cli.csproj" />
+    <Project Path="src/RoslynPad.Core/RoslynPad.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/RoslynPad.Cli.Tests/RoslynPad.Cli.Tests.csproj" />
+    <Project Path="tests/RoslynPad.Core.Tests/RoslynPad.Core.Tests.csproj" />
+  </Folder>
+</Solution>
