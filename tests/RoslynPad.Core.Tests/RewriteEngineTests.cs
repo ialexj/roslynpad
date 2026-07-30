@@ -317,4 +317,187 @@ public sealed class RewriteEngineTests
         }
         finally { Directory.Delete(dir, recursive: true); }
     }
+
+    // -----------------------------------------------------------------------
+    // --repeat-until-stable / --max-iterations
+    // -----------------------------------------------------------------------
+
+    [Fact]
+    public async Task Repeat_until_stable_converges_after_multiple_rounds()
+    {
+        var dir = MakeTempDir();
+        try
+        {
+            var targetPath = await WriteTempFileAsync(dir, "Sample.cs", "class Sample { public void M() { } }\n");
+            var rewriterPath = await WriteTempFileAsync(dir, "IncrementRewriter.cs", """
+                using Microsoft.CodeAnalysis;
+                using Microsoft.CodeAnalysis.CSharp;
+                using Microsoft.CodeAnalysis.CSharp.Syntax;
+
+                public sealed class IncrementRewriter : CSharpSyntaxRewriter
+                {
+                    public override SyntaxNode? VisitMethodDeclaration(MethodDeclarationSyntax node)
+                    {
+                        var name = node.Identifier.ValueText;
+                        var underscoreIndex = name.IndexOf('_');
+                        var count = underscoreIndex < 0 ? 0 : int.Parse(name[(underscoreIndex + 1)..]);
+                        if (count >= 3)
+                            return base.VisitMethodDeclaration(node);
+
+                        var baseName = underscoreIndex < 0 ? name : name[..underscoreIndex];
+                        return node.WithIdentifier(SyntaxFactory.Identifier($"{baseName}_{count + 1}"));
+                    }
+                }
+                """);
+
+            var result = await new RewriteEngine().RunAsync(
+                new RewriteRequest([rewriterPath], ["IncrementRewriter"], repeatUntilStable: true, maxIterations: 10),
+                targetPath, CancellationToken.None);
+
+            var fileResult = Assert.Single(result.FileResults);
+            Assert.True(result.Converged);
+            Assert.Equal(4, result.Iterations); // 3 rounds that change the name, plus 1 confirming round with no changes
+            Assert.Contains("M_3", fileResult.NewText);
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    [Fact]
+    public async Task Repeat_until_stable_reports_non_convergence_when_max_iterations_is_reached()
+    {
+        var dir = MakeTempDir();
+        try
+        {
+            var targetPath = await WriteTempFileAsync(dir, "Sample.cs", "class Sample { public void M() { } }\n");
+            var rewriterPath = await WriteTempFileAsync(dir, "ToggleRewriter.cs", """
+                using Microsoft.CodeAnalysis;
+                using Microsoft.CodeAnalysis.CSharp;
+                using Microsoft.CodeAnalysis.CSharp.Syntax;
+
+                public sealed class ToggleRewriter : CSharpSyntaxRewriter
+                {
+                    public override SyntaxNode? VisitMethodDeclaration(MethodDeclarationSyntax node) =>
+                        node.WithIdentifier(SyntaxFactory.Identifier(node.Identifier.ValueText == "A" ? "B" : "A"));
+                }
+                """);
+
+            var result = await new RewriteEngine().RunAsync(
+                new RewriteRequest([rewriterPath], ["ToggleRewriter"], repeatUntilStable: true, maxIterations: 4),
+                targetPath, CancellationToken.None);
+
+            var fileResult = Assert.Single(result.FileResults);
+            Assert.False(result.Converged);
+            Assert.Equal(4, result.Iterations);
+            Assert.True(fileResult.HasChanges);
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    [Fact]
+    public async Task Repeat_until_stable_preserves_annotations_added_in_an_earlier_round()
+    {
+        // Round 1 marks the method with a SyntaxAnnotation and renames it once; round 2 only takes its
+        // second rename branch if it can still see that annotation on the incoming node - which requires
+        // the tree object (not reparsed text) to have carried it forward from round 1.
+        var dir = MakeTempDir();
+        try
+        {
+            var targetPath = await WriteTempFileAsync(dir, "Sample.cs", "class Sample { public void M() { } }\n");
+            var rewriterPath = await WriteTempFileAsync(dir, "MarkOnceRewriter.cs", """
+                using Microsoft.CodeAnalysis;
+                using Microsoft.CodeAnalysis.CSharp;
+                using Microsoft.CodeAnalysis.CSharp.Syntax;
+
+                public sealed class MarkOnceRewriter : CSharpSyntaxRewriter
+                {
+                    private static readonly SyntaxAnnotation Visited = new("Visited");
+
+                    public override SyntaxNode? VisitMethodDeclaration(MethodDeclarationSyntax node)
+                    {
+                        if (node.HasAnnotation(Visited))
+                        {
+                            return node.Identifier.ValueText == "Marked"
+                                ? node.WithIdentifier(SyntaxFactory.Identifier("ConfirmedAnnotated"))
+                                : base.VisitMethodDeclaration(node);
+                        }
+
+                        return node.Identifier.ValueText == "M"
+                            ? node.WithIdentifier(SyntaxFactory.Identifier("Marked")).WithAdditionalAnnotations(Visited)
+                            : base.VisitMethodDeclaration(node);
+                    }
+                }
+                """);
+
+            var result = await new RewriteEngine().RunAsync(
+                new RewriteRequest([rewriterPath], ["MarkOnceRewriter"], repeatUntilStable: true, maxIterations: 5),
+                targetPath, CancellationToken.None);
+
+            var fileResult = Assert.Single(result.FileResults);
+            Assert.True(result.Converged);
+            Assert.Equal(3, result.Iterations);
+            Assert.Contains("ConfirmedAnnotated", fileResult.NewText);
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    [Fact]
+    public async Task Repeat_until_stable_lets_a_semantic_fix_in_one_file_unlock_a_rewrite_in_another_file()
+    {
+        // File A's syntactic rename (Helper.M -> Ready) only becomes visible to File B's semantic-model
+        // check on the *next* round, since one round's files all read from the same frozen snapshot.
+        var dir = MakeTempDir();
+        try
+        {
+            var fileA = await WriteTempFileAsync(dir, "A.cs", "public class Helper { public void M() { } }\n");
+            var fileB = await WriteTempFileAsync(dir, "B.cs", "public class Consumer { public void M() { } }\n");
+            var rewriterPath = await WriteTempFileAsync(dir, "CrossFileRewriter.cs", """
+                using System.Linq;
+                using Microsoft.CodeAnalysis;
+                using Microsoft.CodeAnalysis.CSharp;
+                using Microsoft.CodeAnalysis.CSharp.Syntax;
+
+                public sealed class CrossFileRewriter : CSharpSyntaxRewriter
+                {
+                    private readonly SemanticModel semanticModel;
+
+                    public CrossFileRewriter(SemanticModel semanticModel)
+                    {
+                        this.semanticModel = semanticModel;
+                    }
+
+                    public override SyntaxNode? VisitMethodDeclaration(MethodDeclarationSyntax node)
+                    {
+                        var containingClass = node.Parent as ClassDeclarationSyntax;
+
+                        if (containingClass?.Identifier.ValueText == "Helper" && node.Identifier.ValueText == "M")
+                        {
+                            return node.WithIdentifier(SyntaxFactory.Identifier("Ready"));
+                        }
+
+                        if (containingClass?.Identifier.ValueText == "Consumer" && node.Identifier.ValueText == "M")
+                        {
+                            var helperType = semanticModel.Compilation.GetTypeByMetadataName("Helper");
+                            var isReady = helperType?.GetMembers("Ready").Any() == true;
+                            return isReady
+                                ? node.WithIdentifier(SyntaxFactory.Identifier("Confirmed"))
+                                : base.VisitMethodDeclaration(node);
+                        }
+
+                        return base.VisitMethodDeclaration(node);
+                    }
+                }
+                """);
+
+            var result = await new RewriteEngine().RunAsync(
+                new RewriteRequest([rewriterPath], ["CrossFileRewriter"], repeatUntilStable: true, maxIterations: 10),
+                [fileA, fileB],
+                CancellationToken.None);
+
+            Assert.True(result.Converged);
+            Assert.Equal(3, result.Iterations);
+            Assert.Contains(result.FileResults, f => f.FilePath == fileA && f.NewText.Contains("Ready"));
+            Assert.Contains(result.FileResults, f => f.FilePath == fileB && f.NewText.Contains("Confirmed"));
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
 }

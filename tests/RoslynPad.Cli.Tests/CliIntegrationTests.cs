@@ -184,4 +184,71 @@ public sealed class CliIntegrationTests
         Assert.Contains("Compiled", rewrittenText);
         Assert.DoesNotContain("Ignored", rewrittenText);
     }
+
+    // -----------------------------------------------------------------------
+    // --repeat-until-stable / --max-iterations
+    // -----------------------------------------------------------------------
+
+    [Fact]
+    public async Task Apply_repeat_until_stable_converges_and_writes_final_stabilized_text()
+    {
+        await using var workspace = CliTestWorkspace.Create();
+        var targetPath = await workspace.WriteClassAsync("Sample.cs", "Sample");
+        var rewriterPath = await workspace.WriteFileAsync("IncrementRewriter.cs", RewriterUtil.Rewriter("IncrementRewriter", """
+            public override SyntaxNode? VisitMethodDeclaration(MethodDeclarationSyntax node) {
+                var name = node.Identifier.ValueText;
+                var underscoreIndex = name.IndexOf('_');
+                var count = underscoreIndex < 0 ? 0 : int.Parse(name[(underscoreIndex + 1)..]);
+                if (count >= 2)
+                    return base.VisitMethodDeclaration(node);
+                var baseName = underscoreIndex < 0 ? name : name[..underscoreIndex];
+                return node.WithIdentifier(Identifier($"{baseName}_{count + 1}"));
+            }
+            """));
+
+        var result = await CliTestHarness.RunCliAsync(
+            "apply", "--rewriter", rewriterPath, "--file", targetPath,
+            "--repeat-until-stable", "--max-iterations", "10", "--detailed-exit-code");
+
+        Assert.True(result.ExitCode == 0, result.FormatForAssertion());
+        Assert.Contains("M_2", await File.ReadAllTextAsync(targetPath));
+    }
+
+    [Fact]
+    public async Task Diff_repeat_until_stable_returns_exit_code_3_when_max_iterations_reached_without_converging()
+    {
+        await using var workspace = CliTestWorkspace.Create();
+        var targetPath = await workspace.WriteClassAsync("Sample.cs", "Sample");
+        var rewriterPath = await workspace.WriteFileAsync("ToggleRewriter.cs", RewriterUtil.Rewriter("ToggleRewriter", """
+            public override SyntaxNode? VisitMethodDeclaration(MethodDeclarationSyntax node) =>
+                node.WithIdentifier(Identifier(node.Identifier.ValueText == "A" ? "B" : "A"));
+            """));
+        var originalText = await File.ReadAllTextAsync(targetPath);
+
+        var result = await CliTestHarness.RunCliAsync(
+            "diff", "--rewriter", rewriterPath, "--file", targetPath,
+            "--repeat-until-stable", "--max-iterations", "3", "--detailed-exit-code");
+
+        Assert.Equal(3, result.ExitCode);
+        Assert.Equal(originalText, await File.ReadAllTextAsync(targetPath)); // diff never touches disk
+    }
+
+    [Fact]
+    public async Task Apply_repeat_until_stable_writes_best_effort_result_when_non_convergent()
+    {
+        await using var workspace = CliTestWorkspace.Create();
+        var targetPath = await workspace.WriteClassAsync("Sample.cs", "Sample");
+        var rewriterPath = await workspace.WriteFileAsync("ToggleRewriter.cs", RewriterUtil.Rewriter("ToggleRewriter", """
+            public override SyntaxNode? VisitMethodDeclaration(MethodDeclarationSyntax node) =>
+                node.WithIdentifier(Identifier(node.Identifier.ValueText == "A" ? "B" : "A"));
+            """));
+
+        var result = await CliTestHarness.RunCliAsync(
+            "apply", "--rewriter", rewriterPath, "--file", targetPath,
+            "--repeat-until-stable", "--max-iterations", "3", "--detailed-exit-code");
+
+        Assert.Equal(3, result.ExitCode);
+        // Non-convergent, but the last round's best-effort output (round 3 lands on "A") is still written.
+        Assert.Contains("public void A()", await File.ReadAllTextAsync(targetPath));
+    }
 }

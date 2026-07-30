@@ -70,7 +70,8 @@ public sealed class RewriterLoader
             .Where(t => typeof(CSharpSyntaxRewriter).IsAssignableFrom(t) && !t.IsAbstract && !t.IsGenericTypeDefinition)
             .ToList();
 
-    private static IReadOnlyList<MetadataReference> GetReferences()
+    /// <summary>Shared framework reference set, also used by RewriteEngine to host loose (non-project) files.</summary>
+    internal static IReadOnlyList<MetadataReference> GetReferences()
     {
         var trustedPlatformAssemblies = (string?)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES");
         if (trustedPlatformAssemblies is null)

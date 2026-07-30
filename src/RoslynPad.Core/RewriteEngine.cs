@@ -18,35 +18,88 @@ public sealed class RewriteEngine
 
     public async Task<RewriteResult> RunAsync(RewriteRequest request, IReadOnlyCollection<string> targetFilePaths, CancellationToken cancellationToken)
     {
-        var pipelineTypes = new RewriterPipelineResolver(loader).Resolve(request.RewriterPaths, request.TypeNames);
-
-        var filePaths = targetFilePaths.ToArray();
-        var fileResults = new FileRewriteResult[filePaths.Length];
-
-        await Parallel.ForEachAsync(
-            Enumerable.Range(0, filePaths.Length),
-            new ParallelOptions { CancellationToken = cancellationToken },
-            async (index, token) =>
-            {
-                fileResults[index] = await RewriteFileAsync(pipelineTypes, filePaths[index], token);
-            });
-
-        return new RewriteResult(fileResults);
+        var (solution, documentIds) = await BuildAdhocSolutionAsync(targetFilePaths, cancellationToken);
+        return await RunAsync(request, solution, documentIds, cancellationToken);
     }
 
-    private async Task<FileRewriteResult> RewriteFileAsync(IReadOnlyList<Type> pipelineTypes, string targetFilePath, CancellationToken cancellationToken)
+    /// <summary>Runs the pipeline over documents that already belong to one shared Solution, so semantic models can see across files.</summary>
+    public async Task<RewriteResult> RunAsync(RewriteRequest request, Solution solution, IReadOnlyList<DocumentId> targetDocumentIds, CancellationToken cancellationToken)
     {
-        var sourceText = SourceText.From(await File.ReadAllTextAsync(targetFilePath, cancellationToken), Encoding.UTF8);
-        var workspace = new AdhocWorkspace();
-        var projectId = ProjectId.CreateNewId();
-        var projectInfo = ProjectInfo.Create(projectId, VersionStamp.Create(), "InMemory", assemblyName: "InMemoryAssembly", language: LanguageNames.CSharp, filePath: null, outputFilePath: null);
-        projectInfo = projectInfo.WithParseOptions(new CSharpParseOptions(LanguageVersion.Latest));
-        _ = workspace.AddProject(projectInfo);
-        var document = workspace.AddDocument(projectId, Path.GetFileName(targetFilePath), sourceText);
+        var pipelineTypes = new RewriterPipelineResolver(loader).Resolve(request.RewriterPaths, request.TypeNames);
 
-        var originalRoot = await document.GetSyntaxRootAsync(cancellationToken)
+        var originalRoots = new SyntaxNode[targetDocumentIds.Count];
+        for (var index = 0; index < targetDocumentIds.Count; index++)
+        {
+            var document = solution.GetDocument(targetDocumentIds[index])
+                ?? throw new InvalidOperationException("Target document not found in solution.");
+            originalRoots[index] = await document.GetSyntaxRootAsync(cancellationToken)
+                ?? throw new InvalidOperationException("The document syntax root could not be loaded.");
+        }
+
+        var currentSolution = solution;
+        var currentRoots = (SyntaxNode[])originalRoots.Clone();
+        var maxIterations = request.RepeatUntilStable ? request.MaxIterations : 1;
+        var converged = false;
+        var iterations = 0;
+
+        for (var round = 1; round <= maxIterations; round++)
+        {
+            iterations = round;
+
+            // Every document in this round reads from the same frozen snapshot, so a fix made to one
+            // file only becomes visible to another file's semantic model on the *next* round.
+            var roundSolution = currentSolution;
+            var roundRoots = new SyntaxNode[targetDocumentIds.Count];
+
+            await Parallel.ForEachAsync(
+                Enumerable.Range(0, targetDocumentIds.Count),
+                new ParallelOptions { CancellationToken = cancellationToken },
+                async (index, token) =>
+                {
+                    roundRoots[index] = await RunPipelineAsync(pipelineTypes, roundSolution, targetDocumentIds[index], token);
+                });
+
+            var roundChanged = false;
+            for (var index = 0; index < targetDocumentIds.Count; index++)
+            {
+                if (!roundRoots[index].IsEquivalentTo(currentRoots[index]))
+                {
+                    roundChanged = true;
+                }
+
+                // Fold this round's tree object (not text) back into the solution so annotations survive into the next round.
+                currentSolution = currentSolution.WithDocumentSyntaxRoot(targetDocumentIds[index], roundRoots[index]);
+            }
+
+            currentRoots = roundRoots;
+
+            if (!request.RepeatUntilStable || !roundChanged)
+            {
+                converged = true;
+                break;
+            }
+        }
+
+        var fileResults = new FileRewriteResult[targetDocumentIds.Count];
+        for (var index = 0; index < targetDocumentIds.Count; index++)
+        {
+            var document = solution.GetDocument(targetDocumentIds[index])!;
+            fileResults[index] = new FileRewriteResult(
+                document.FilePath ?? document.Name,
+                originalRoots[index].ToFullString(),
+                currentRoots[index].ToFullString(),
+                !currentRoots[index].IsEquivalentTo(originalRoots[index]));
+        }
+
+        return new RewriteResult(fileResults, converged, iterations);
+    }
+
+    private async Task<SyntaxNode> RunPipelineAsync(IReadOnlyList<Type> pipelineTypes, Solution solution, DocumentId documentId, CancellationToken cancellationToken)
+    {
+        var document = solution.GetDocument(documentId)
+            ?? throw new InvalidOperationException("Target document not found in solution.");
+        var currentRoot = await document.GetSyntaxRootAsync(cancellationToken)
             ?? throw new InvalidOperationException("The document syntax root could not be loaded.");
-        var currentRoot = originalRoot;
 
         // Track a document snapshot so we can recompute SemanticModel when a stage needs it.
         var currentDocument = document;
@@ -66,10 +119,35 @@ public sealed class RewriteEngine
                 ?? throw new InvalidOperationException($"Rewriter '{stageType.FullName}' returned null from Visit.");
         }
 
-        return new FileRewriteResult(
-            targetFilePath,
-            originalRoot.ToFullString(),
-            currentRoot.ToFullString(),
-            !currentRoot.IsEquivalentTo(originalRoot));
+        return currentRoot;
+    }
+
+    /// <summary>Hosts loose (non-project) target files as sibling documents in one Solution, with framework references so semantic models resolve BCL types.</summary>
+    private static async Task<(Solution Solution, IReadOnlyList<DocumentId> DocumentIds)> BuildAdhocSolutionAsync(IReadOnlyCollection<string> targetFilePaths, CancellationToken cancellationToken)
+    {
+        var workspace = new AdhocWorkspace();
+        var projectId = ProjectId.CreateNewId();
+        var projectInfo = ProjectInfo.Create(
+            projectId,
+            VersionStamp.Create(),
+            "InMemory",
+            assemblyName: "InMemoryAssembly",
+            language: LanguageNames.CSharp,
+            filePath: null,
+            outputFilePath: null,
+            metadataReferences: RewriterLoader.GetReferences());
+        projectInfo = projectInfo.WithParseOptions(new CSharpParseOptions(LanguageVersion.Latest));
+        var solution = workspace.CurrentSolution.AddProject(projectInfo);
+
+        var documentIds = new List<DocumentId>(targetFilePaths.Count);
+        foreach (var path in targetFilePaths)
+        {
+            var sourceText = SourceText.From(await File.ReadAllTextAsync(path, cancellationToken), Encoding.UTF8);
+            var documentId = DocumentId.CreateNewId(projectId);
+            solution = solution.AddDocument(documentId, Path.GetFileName(path), sourceText, filePath: path);
+            documentIds.Add(documentId);
+        }
+
+        return (solution, documentIds);
     }
 }

@@ -37,10 +37,21 @@ var solutionOption = new Option<string>("--solution")
 
 var detailedExitCodeOption = new Option<bool>("--detailed-exit-code")
 {
-    Description = "Return detailed exit codes: 0 when changes are made, 1 when no changes occur, and 2 for rewriter/load errors."
+    Description = "Return detailed exit codes: 0 when changes are made, 1 when no changes occur, 2 for rewriter/load errors, and 3 when --repeat-until-stable does not converge."
 };
 
-static async Task<IReadOnlyCollection<string>> ResolveTargetFilesAsync(string? filePath, string? projectPath, string? solutionPath, CancellationToken cancellationToken)
+var repeatUntilStableOption = new Option<bool>("--repeat-until-stable")
+{
+    Description = "Re-run the full pipeline against the previous round's in-memory result until a round makes no changes across all target files, or --max-iterations is reached."
+};
+
+var maxIterationsOption = new Option<int>("--max-iterations")
+{
+    Description = "Caps the number of --repeat-until-stable rounds. Only meaningful alongside --repeat-until-stable. Defaults to 10."
+};
+maxIterationsOption.SetDefaultValue(10);
+
+static async Task<ResolvedTarget> ResolveTargetAsync(string? filePath, string? projectPath, string? solutionPath, CancellationToken cancellationToken)
 {
     var selectedTargets = new[] { filePath, projectPath, solutionPath }.Count(path => !string.IsNullOrWhiteSpace(path));
     if (selectedTargets != 1)
@@ -50,32 +61,32 @@ static async Task<IReadOnlyCollection<string>> ResolveTargetFilesAsync(string? f
 
     if (!string.IsNullOrWhiteSpace(filePath))
     {
-        return [Path.GetFullPath(filePath)];
+        return new ResolvedTarget(Path.GetFullPath(filePath), null, [], null);
     }
 
     MSBuildLocator.RegisterDefaults();
 
-    using var workspace = MSBuildWorkspace.Create();
-    var targetDocuments = new List<Document>();
+    // Kept open (not disposed) until the engine call completes so the real Solution/references it produced stay usable.
+    var workspace = MSBuildWorkspace.Create();
+    Solution solution;
+    IEnumerable<Document> candidateDocuments;
 
     if (!string.IsNullOrWhiteSpace(projectPath))
     {
         var project = await workspace.OpenProjectAsync(projectPath, progress: null, cancellationToken);
-        targetDocuments.AddRange(project.Documents);
+        solution = project.Solution;
+        candidateDocuments = project.Documents;
     }
-    else if (!string.IsNullOrWhiteSpace(solutionPath))
+    else
     {
-        var solution = await workspace.OpenSolutionAsync(solutionPath, progress: null, cancellationToken);
-        foreach (var project in solution.Projects)
-        {
-            targetDocuments.AddRange(project.Documents);
-        }
+        solution = await workspace.OpenSolutionAsync(solutionPath!, progress: null, cancellationToken);
+        candidateDocuments = solution.Projects.SelectMany(project => project.Documents);
     }
 
-    var uniquePaths = new List<string>();
+    var documentIds = new List<DocumentId>();
     var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-    foreach (var document in targetDocuments)
+    foreach (var document in candidateDocuments)
     {
         if (document.FilePath is not { } documentPath)
             continue;
@@ -90,22 +101,37 @@ static async Task<IReadOnlyCollection<string>> ResolveTargetFilesAsync(string? f
             continue;
         }
 
-        var fullPath = Path.GetFullPath(documentPath);
-        if (seenPaths.Add(fullPath))
+        if (seenPaths.Add(Path.GetFullPath(documentPath)))
         {
-            uniquePaths.Add(fullPath);
+            documentIds.Add(document.Id);
         }
     }
 
-    return uniquePaths;
+    return new ResolvedTarget(null, solution, documentIds, workspace);
 }
 
-static async Task<RewriteResult> RunAsync(string[] rewriterPaths, string[] rewriterTypes, string? filePath, string? projectPath, string? solutionPath)
+static async Task<RewriteResult> RunAsync(
+    string[] rewriterPaths,
+    string[] rewriterTypes,
+    string? filePath,
+    string? projectPath,
+    string? solutionPath,
+    bool repeatUntilStable,
+    int maxIterations)
 {
     var engine = new RewriteEngine();
-    var request = new RewriteRequest(rewriterPaths, rewriterTypes);
-    var targetFiles = await ResolveTargetFilesAsync(filePath, projectPath, solutionPath, CancellationToken.None);
-    return await engine.RunAsync(request, targetFiles, CancellationToken.None);
+    var request = new RewriteRequest(rewriterPaths, rewriterTypes, repeatUntilStable, maxIterations);
+    var resolved = await ResolveTargetAsync(filePath, projectPath, solutionPath, CancellationToken.None);
+    try
+    {
+        return resolved.LooseFilePath is { } loosePath
+            ? await engine.RunAsync(request, loosePath, CancellationToken.None)
+            : await engine.RunAsync(request, resolved.Solution!, resolved.DocumentIds, CancellationToken.None);
+    }
+    finally
+    {
+        resolved.Workspace?.Dispose();
+    }
 }
 
 static async Task<int> RunWithExitCodeAsync(
@@ -115,12 +141,20 @@ static async Task<int> RunWithExitCodeAsync(
     string? filePath,
     string? projectPath,
     string? solutionPath,
+    bool repeatUntilStable,
+    int maxIterations,
     Func<RewriteResult, Task> onSuccessAsync)
 {
     try
     {
-        var result = await RunAsync(rewriterPaths, rewriterTypes, filePath, projectPath, solutionPath);
+        var result = await RunAsync(rewriterPaths, rewriterTypes, filePath, projectPath, solutionPath, repeatUntilStable, maxIterations);
         await onSuccessAsync(result);
+
+        if (repeatUntilStable && !result.Converged)
+        {
+            return detailedExitCode ? 3 : 1;
+        }
+
         return detailedExitCode ? (result.HasAnyChanges ? 0 : 1) : 0;
     }
     catch (Exception ex)
@@ -137,6 +171,8 @@ diffCommand.AddOption(fileOption);
 diffCommand.AddOption(projectOption);
 diffCommand.AddOption(solutionOption);
 diffCommand.AddOption(detailedExitCodeOption);
+diffCommand.AddOption(repeatUntilStableOption);
+diffCommand.AddOption(maxIterationsOption);
 
 diffCommand.SetHandler(async (InvocationContext context) =>
 {
@@ -146,8 +182,10 @@ diffCommand.SetHandler(async (InvocationContext context) =>
     var targetFile = context.ParseResult.GetValueForOption(fileOption);
     var targetProject = context.ParseResult.GetValueForOption(projectOption);
     var targetSolution = context.ParseResult.GetValueForOption(solutionOption);
+    var repeatUntilStable = context.ParseResult.GetValueForOption(repeatUntilStableOption);
+    var maxIterations = context.ParseResult.GetValueForOption(maxIterationsOption);
 
-    var exitCode = await RunWithExitCodeAsync(detailedExitCode, rewriterPaths, rewriterTypes, targetFile, targetProject, targetSolution, async result =>
+    var exitCode = await RunWithExitCodeAsync(detailedExitCode, rewriterPaths, rewriterTypes, targetFile, targetProject, targetSolution, repeatUntilStable, maxIterations, async result =>
     {
         Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(result, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
         await Task.CompletedTask;
@@ -163,6 +201,8 @@ applyCommand.AddOption(fileOption);
 applyCommand.AddOption(projectOption);
 applyCommand.AddOption(solutionOption);
 applyCommand.AddOption(detailedExitCodeOption);
+applyCommand.AddOption(repeatUntilStableOption);
+applyCommand.AddOption(maxIterationsOption);
 
 applyCommand.SetHandler(async (InvocationContext context) =>
 {
@@ -172,8 +212,10 @@ applyCommand.SetHandler(async (InvocationContext context) =>
     var targetFile = context.ParseResult.GetValueForOption(fileOption);
     var targetProject = context.ParseResult.GetValueForOption(projectOption);
     var targetSolution = context.ParseResult.GetValueForOption(solutionOption);
+    var repeatUntilStable = context.ParseResult.GetValueForOption(repeatUntilStableOption);
+    var maxIterations = context.ParseResult.GetValueForOption(maxIterationsOption);
 
-    var exitCode = await RunWithExitCodeAsync(detailedExitCode, rewriterPaths, rewriterTypes, targetFile, targetProject, targetSolution, async result =>
+    var exitCode = await RunWithExitCodeAsync(detailedExitCode, rewriterPaths, rewriterTypes, targetFile, targetProject, targetSolution, repeatUntilStable, maxIterations, async result =>
     {
         foreach (var fileResult in result.FileResults.Where(fileResult => fileResult.HasChanges))
         {
@@ -190,3 +232,5 @@ rootCommand.Add(diffCommand);
 rootCommand.Add(applyCommand);
 
 return await rootCommand.InvokeAsync(args);
+
+sealed record ResolvedTarget(string? LooseFilePath, Solution? Solution, IReadOnlyList<DocumentId> DocumentIds, MSBuildWorkspace? Workspace);

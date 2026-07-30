@@ -130,6 +130,10 @@ internal sealed record CliCommandResult(int ExitCode, string StandardOutput, str
 internal sealed class DiffCommandResult
 {
     public IReadOnlyList<DiffFileResult> FileResults { get; init; } = [];
+
+    public bool Converged { get; init; } = true;
+
+    public int Iterations { get; init; } = 1;
 }
 
 internal sealed class DiffFileResult
