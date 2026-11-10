@@ -17,4 +17,11 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>roslynpad</ToolCommandName>
+    <PackageId>RoslynPad.Cli</PackageId>
+    <Version>0.0.1</Version>
+  </PropertyGroup>
+
 </Project>
