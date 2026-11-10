@@ -80,16 +80,31 @@ soon as any `--rewriter` value is a `.dll` — the default declaration-order exp
 - The rewriter class is not known at compile time: compiled/loaded dynamically at runtime (Roslyn scripting or
   compile-to-assembly + load, or a precompiled `.dll` loaded directly via reflection), then located via
   reflection (`CSharpSyntaxRewriter`/`CSharpSyntaxWalker` subclasses in the given source file or assembly).
-- A source file may declare multiple rewriter classes. By default all of them run, in declaration order,
-  each becoming its own pipeline stage (see 3.2); an explicit `--type` list overrides this and fully defines
-  the pipeline instead. A precompiled `.dll` has no declaration-order fallback, so `--type` is mandatory
+- A source file may declare multiple rewriter classes. By default all **top-level** ones run, in
+  declaration order (nested rewriter classes — those declared inside another type — are excluded from this
+  automatic expansion; see 3.2), each becoming its own pipeline stage; an explicit `--type` list overrides
+  this and fully defines the pipeline instead, and is not subject to the nested-exclusion rule (it can still
+  name a nested rewriter). A precompiled `.dll` has no declaration-order fallback, so `--type` is mandatory
   whenever a `.dll` is passed.
-- A **fresh rewriter instance is created per file** when running against a project/solution. This is the
-  natural model for stateless, per-file semantic data and avoids leaking per-file fields across unrelated
-  documents.
+- A **fresh rewriter instance is created per (file, stage)** when running against a project/solution. This
+  is the natural model for stateless, per-file semantic data and avoids leaking per-file fields across
+  unrelated documents.
 - Constructor parameters are resolved via a small convention-based DI: the harness maintains a set of
   available service instances for the run and matches constructor parameters by type. No forced base class
-  required, though a convenience base class may be offered later.
+  required, though a convenience base class may be offered later. The injectable parameter types are:
+  - `SemanticModel` — the current document's semantic model (recomputed per stage when needed; see 3.1).
+  - `Compilation` — the whole compilation for the current project (recomputed per stage when needed; see 3.1).
+    A rewriter that wants to inspect symbols across the entire solution (e.g. "collect all variables of a
+    given type") should take a `Compilation` rather than reaching into `SemanticModel.Compilation`.
+  - `Document` — the current document.
+  - `Project` — the current project.
+  - `SyntaxTree` — the current document's syntax tree.
+  - `IDictionary<object, object>` — a **run-scoped** state dictionary, shared across every stage, every
+    document, and every `--repeat-until-stable` round within a single engine call. A rewriter can record
+    data in one stage and read it in a later stage (or a later round) without any explicit hand-off. The
+    concrete implementation is thread-safe (a `ConcurrentDictionary`), so parallel per-file processing
+    within a stage is safe.
+  - `CancellationToken` — the run's cancellation token.
 
 ### 3.1 Semantic model support
 
@@ -101,11 +116,13 @@ soon as any `--rewriter` value is a `.dll` — the default declaration-order exp
   before constructing its replacement.
 - The harness injects the current document's `SemanticModel` into the rewriter's constructor if a matching
   parameter is present.
-- Whole-project runs use a single, consistent snapshot: all semantic models for the run derive from the
-  original solution's compilation. Rewriting file A does not change what file B's semantic model sees during
-  the same run. Convergence across *separate* tool invocations (where a change made by a prior run should
-  affect understanding of a later run) requires re-running the tool on the updated solution — not something
-  the harness solves internally. (Within a single run's rewriter *pipeline*, this is handled — see 3.2.)
+- Whole-project runs use a single, consistent snapshot **per stage**: all semantic models for a given stage
+  derive from the Solution as it stands at the start of that stage (i.e. after all prior stages have folded
+  their edits back in). Rewriting file A in stage 1 *does* change what file B's semantic model sees in stage
+  2 of the same pass — see 3.2. Convergence across *separate* tool invocations (where a change made by a
+  prior run should affect understanding of a later run) requires re-running the tool on the updated solution
+  — not something the harness solves internally. (Within a single run, cross-file visibility is handled by
+  the per-stage pipeline order — see 3.2.)
 - This behaves identically whether the `Solution` came from `MSBuildWorkspace` (CLI) or `VisualStudioWorkspace`
   (VS) — same `Project`/`Document`/`Compilation`/`SemanticModel` API surface. Getting a semantic model per
   document is cheap; the project's `Compilation` is computed/cached once and per-file models are derived
@@ -120,9 +137,11 @@ soon as any `--rewriter` value is a `.dll` — the default declaration-order exp
   Order is significant and explicitly captured by the host (see CLI shape above for how the CLI captures it).
 - The final stage list is built one of two ways:
   - **Default (no `--type`)**: only possible when every `--rewriter` value is a `.cs` source file. Expand each
-    `--rewriter` occurrence, in the order given, into the rewriter type(s) declared in that file, in
-    declaration order. E.g. `--rewriter A.cs --rewriter B.cs` where `A.cs` declares two rewriter classes
-    produces a three-stage pipeline: `A`'s first type, `A`'s second type, then `B`'s type.
+    `--rewriter` occurrence, in the order given, into the **top-level** rewriter type(s) declared in that file,
+    in declaration order (nested rewriter classes — those declared inside another type — are excluded from
+    this automatic expansion, since they're typically helpers rather than standalone stages; an explicit
+    `--type` can still name one). E.g. `--rewriter A.cs --rewriter B.cs` where `A.cs` declares two top-level
+    rewriter classes produces a three-stage pipeline: `A`'s first type, `A`'s second type, then `B`'s type.
   - **Explicit (`--type` passed, or any `--rewriter` is a `.dll`)**: the ordered list of `--type` values *is*
     the pipeline, each name resolved against the set of types compiled/loaded from all `--rewriter` files and
     assemblies — regardless of how many types those sources declare. Pipeline order and membership come
@@ -130,16 +149,27 @@ soon as any `--rewriter` value is a `.dll` — the default declaration-order exp
 - Running the same rewriter file more than once in one pipeline is supported — each occurrence is an
   independent stage and gets its own fresh instance, per the "fresh instance per file" rule in section 3,
   applied per (file, stage) rather than just per file.
+- **Stage-major processing order**: the engine runs the pipeline **per rewriter stage, not per file**. Stage 1
+  processes *every* target file before stage 2 begins; stage 2 processes every file before stage 3 begins; and
+  so on. After a stage finishes, its per-file edited trees are folded back into the shared `Solution` (via
+  `Solution.WithDocumentSyntaxRoot`, passing the tree object) *before* the next stage starts. This means a
+  change made by stage 1 to file A is visible to stage 2's `SemanticModel` for file B in the **same pass** —
+  no `--repeat-until-stable` round is needed for cross-file visibility *between stages*. (Cross-file
+  visibility *within a single stage* still requires a repeat-until-stable round, since all files in one stage
+  read from the same frozen snapshot — see 3.3.)
 - Per document, the syntax tree flows between stages as a live in-memory `SyntaxNode` object — the engine
   updates the document via `Solution.WithDocumentSyntaxRoot`/`Document.WithSyntaxRoot` (passing the tree
   object), never by reparsing from text. This means `SyntaxAnnotation`s added by an earlier stage remain
   visible to later stages in the same run (see section 3.1's discussion of annotations vs. captures).
-- **Compilation is only recomputed between stages when the next stage needs it.** Before constructing a
-  stage's rewriter instance, the engine checks whether that rewriter's constructor requests a `SemanticModel`.
-  If not, the engine skips updating the `Solution`/`Compilation` and passes the tree straight to that stage —
-  cheaper, and correct since the stage isn't consuming semantic info anyway. If it does, the engine first
-  updates the document's syntax root to the current tree (object, not text) and obtains a fresh
-  `SemanticModel` from the recomputed `Compilation` before instantiating that stage.
+- **Compilation is only recomputed for a stage when that stage needs it.** Before constructing a stage's
+  rewriter instance for a given document, the engine checks whether that rewriter's constructor requests a
+  `SemanticModel` or a `Compilation`. If not, the engine skips obtaining one and passes the tree straight to
+  that stage — cheaper, and correct since the stage isn't consuming semantic info anyway. If it does, the
+  engine obtains a fresh `SemanticModel` (and the `Compilation` it derives from) from the document, which
+  already carries the prior stage's folded-in tree, so the model reflects every earlier stage's edits
+  across all files. This is what makes the canonical "collect → find → act" pattern work in a single pass:
+  stage 1 collects symbols across the solution, stage 2's `Compilation` sees stage 1's new members, and
+  stage 3 acts on what stage 2 found — all without `--repeat-until-stable`.
 - This logic lives entirely in the shared engine, so behavior is identical across hosts — **provided the host
   calls the engine once for the whole pipeline**, rather than chaining separate single-rewriter invocations
   itself.

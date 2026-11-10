@@ -1,25 +1,38 @@
 using System.Reflection;
 using System.Runtime.Loader;
+using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Emit;
 
 namespace RoslynPad.Core;
 
 public sealed class RewriterLoader
 {
-    internal RewriterSource Load(string path)
+    private const string ImplicitUsings = """
+        global using System;
+        global using System.Linq;
+        global using System.Diagnostics;
+        global using System.Collections.Generic;
+        global using Microsoft.CodeAnalysis;
+        global using Microsoft.CodeAnalysis.CSharp;
+        global using Microsoft.CodeAnalysis.CSharp.Syntax;
+        """;
+
+    internal RewriterSource Load(string path, bool emitDebugSymbols = false)
     {
-        return IsDll(path) ? LoadFromDll(path) : LoadFromSource(path);
+        return IsDll(path) ? LoadFromDll(path) : LoadFromSource(path, emitDebugSymbols);
     }
 
     internal static bool IsDll(string path) =>
         string.Equals(Path.GetExtension(path), ".dll", StringComparison.OrdinalIgnoreCase);
 
-    private static RewriterSource LoadFromSource(string sourcePath)
+    private static RewriterSource LoadFromSource(string sourcePath, bool emitDebugSymbols)
     {
         var sourceText = File.ReadAllText(sourcePath);
-        var syntaxTree = CSharpSyntaxTree.ParseText(sourceText, path: sourcePath);
+        var syntaxTree = CSharpSyntaxTree.ParseText(sourceText, path: sourcePath, encoding: Encoding.UTF8);
+        var implicitUsingsTree = CSharpSyntaxTree.ParseText(ImplicitUsings, path: "ImplicitUsings.g.cs", encoding: Encoding.UTF8);
         var diagnostics = syntaxTree.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
         if (diagnostics.Count > 0)
         {
@@ -29,20 +42,27 @@ public sealed class RewriterLoader
         var references = GetReferences();
         var compilation = CSharpCompilation.Create(
             assemblyName: Path.GetFileNameWithoutExtension(sourcePath),
-            syntaxTrees: [syntaxTree],
+            syntaxTrees: [implicitUsingsTree, syntaxTree],
             references: references,
             options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
 
-        using var stream = new MemoryStream();
-        var emitResult = compilation.Emit(stream);
+        using var assemblyStream = new MemoryStream();
+        using var symbolStream = emitDebugSymbols ? new MemoryStream() : null;
+        var emitOptions = emitDebugSymbols
+            ? new EmitOptions(debugInformationFormat: DebugInformationFormat.PortablePdb)
+            : null;
+        var emitResult = compilation.Emit(assemblyStream, symbolStream, options: emitOptions);
         if (!emitResult.Success)
         {
             throw new InvalidOperationException($"Rewriter compilation failed:{Environment.NewLine}{string.Join(Environment.NewLine, emitResult.Diagnostics.Where(d => d.Severity == DiagnosticSeverity.Error).Select(d => d.ToString()))}");
         }
 
-        stream.Position = 0;
+        assemblyStream.Position = 0;
+        symbolStream?.Position = 0;
         var alc = new CollectibleAssemblyLoadContext();
-        var assembly = alc.LoadFromStream(stream);
+        var assembly = symbolStream is null
+            ? alc.LoadFromStream(assemblyStream)
+            : alc.LoadFromStream(assemblyStream, symbolStream);
         var types = FindCandidateTypes(assembly);
 
         if (types.Count == 0)

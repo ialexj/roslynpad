@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -25,7 +26,7 @@ public sealed class RewriteEngine
     /// <summary>Runs the pipeline over documents that already belong to one shared Solution, so semantic models can see across files.</summary>
     public async Task<RewriteResult> RunAsync(RewriteRequest request, Solution solution, IReadOnlyList<DocumentId> targetDocumentIds, CancellationToken cancellationToken)
     {
-        var pipelineTypes = new RewriterPipelineResolver(loader).Resolve(request.RewriterPaths, request.TypeNames);
+        var pipelineTypes = new RewriterPipelineResolver(loader).Resolve(request.RewriterPaths, request.TypeNames, request.EmitDebugSymbols);
 
         var originalRoots = new SyntaxNode[targetDocumentIds.Count];
         for (var index = 0; index < targetDocumentIds.Count; index++)
@@ -36,6 +37,7 @@ public sealed class RewriteEngine
                 ?? throw new InvalidOperationException("The document syntax root could not be loaded.");
         }
 
+        var state = new ConcurrentDictionary<object, object>();
         var currentSolution = solution;
         var currentRoots = (SyntaxNode[])originalRoots.Clone();
         var maxIterations = request.RepeatUntilStable ? request.MaxIterations : 1;
@@ -46,32 +48,43 @@ public sealed class RewriteEngine
         {
             iterations = round;
 
-            // Every document in this round reads from the same frozen snapshot, so a fix made to one
-            // file only becomes visible to another file's semantic model on the *next* round.
-            var roundSolution = currentSolution;
-            var roundRoots = new SyntaxNode[targetDocumentIds.Count];
-
-            await Parallel.ForEachAsync(
-                Enumerable.Range(0, targetDocumentIds.Count),
-                new ParallelOptions { CancellationToken = cancellationToken },
-                async (index, token) =>
-                {
-                    roundRoots[index] = await RunPipelineAsync(pipelineTypes, roundSolution, targetDocumentIds[index], token);
-                });
-
+            // Each rewriter stage processes ALL target files before the next stage begins.
+            // Folding a stage's changes back into the Solution before the next stage starts
+            // means a later stage's SemanticModel sees earlier stages' edits across every
+            // file in the same pass — a fix in file A is visible to file B's semantic model
+            // in the very next stage, without waiting for a repeat-until-stable round.
             var roundChanged = false;
-            for (var index = 0; index < targetDocumentIds.Count; index++)
+
+            foreach (var stageType in pipelineTypes)
             {
-                if (!roundRoots[index].IsEquivalentTo(currentRoots[index]))
+                // Every document in this stage reads from the same frozen snapshot, so a fix
+                // made to one file only becomes visible to another file's semantic model in
+                // the *next* stage (or the next round).
+                var stageSolution = currentSolution;
+                var stageRoots = new SyntaxNode[targetDocumentIds.Count];
+
+                await Parallel.ForEachAsync(
+                    Enumerable.Range(0, targetDocumentIds.Count),
+                    new ParallelOptions { CancellationToken = cancellationToken },
+                    async (index, token) =>
+                    {
+                        stageRoots[index] = await RunStageAsync(stageType, stageSolution, targetDocumentIds[index], state, token);
+                    });
+
+                for (var index = 0; index < targetDocumentIds.Count; index++)
                 {
-                    roundChanged = true;
+                    if (!stageRoots[index].IsEquivalentTo(currentRoots[index]))
+                    {
+                        roundChanged = true;
+                    }
+
+                    // Fold this stage's tree object (not text) back into the solution so
+                    // annotations survive into the next stage.
+                    currentSolution = currentSolution.WithDocumentSyntaxRoot(targetDocumentIds[index], stageRoots[index]);
                 }
 
-                // Fold this round's tree object (not text) back into the solution so annotations survive into the next round.
-                currentSolution = currentSolution.WithDocumentSyntaxRoot(targetDocumentIds[index], roundRoots[index]);
+                currentRoots = stageRoots;
             }
-
-            currentRoots = roundRoots;
 
             if (!request.RepeatUntilStable || !roundChanged)
             {
@@ -94,32 +107,28 @@ public sealed class RewriteEngine
         return new RewriteResult(fileResults, converged, iterations);
     }
 
-    private async Task<SyntaxNode> RunPipelineAsync(IReadOnlyList<Type> pipelineTypes, Solution solution, DocumentId documentId, CancellationToken cancellationToken)
+    private async Task<SyntaxNode> RunStageAsync(Type stageType, Solution solution, DocumentId documentId, ConcurrentDictionary<object, object> state, CancellationToken cancellationToken)
     {
         var document = solution.GetDocument(documentId)
             ?? throw new InvalidOperationException("Target document not found in solution.");
         var currentRoot = await document.GetSyntaxRootAsync(cancellationToken)
             ?? throw new InvalidOperationException("The document syntax root could not be loaded.");
 
-        // Track a document snapshot so we can recompute SemanticModel when a stage needs it.
-        var currentDocument = document;
         SemanticModel? currentSemanticModel = null;
-
-        foreach (var stageType in pipelineTypes)
+        Compilation? currentCompilation = null;
+        if (RewriterActivator.RequiresSemanticModel(stageType))
         {
-            if (RewriterActivator.RequiresSemanticModel(stageType))
-            {
-                // Update the document to the current in-memory tree before getting a fresh SemanticModel.
-                currentDocument = currentDocument.WithSyntaxRoot(currentRoot);
-                currentSemanticModel = await currentDocument.GetSemanticModelAsync(cancellationToken);
-            }
-
-            var rewriterInstance = (CSharpSyntaxRewriter)activator.Create(stageType, currentDocument, currentSemanticModel, cancellationToken);
-            currentRoot = rewriterInstance.Visit(currentRoot)
-                ?? throw new InvalidOperationException($"Rewriter '{stageType.FullName}' returned null from Visit.");
+            // The document already carries the current in-memory tree (folded in by the
+            // previous stage), so a fresh SemanticModel reflects every prior stage's edits.
+            // The Compilation is recomputed here too, so a stage that asks for a Compilation
+            // sees the symbols produced by every earlier stage across all files.
+            currentSemanticModel = await document.GetSemanticModelAsync(cancellationToken);
+            currentCompilation = currentSemanticModel?.Compilation;
         }
 
-        return currentRoot;
+        var rewriterInstance = (CSharpSyntaxRewriter)activator.Create(stageType, document, currentSemanticModel, currentCompilation, state, cancellationToken);
+        return rewriterInstance.Visit(currentRoot)
+            ?? throw new InvalidOperationException($"Rewriter '{stageType.FullName}' returned null from Visit.");
     }
 
     /// <summary>Hosts loose (non-project) target files as sibling documents in one Solution, with framework references so semantic models resolve BCL types.</summary>
