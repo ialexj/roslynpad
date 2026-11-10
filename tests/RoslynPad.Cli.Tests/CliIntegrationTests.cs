@@ -34,7 +34,8 @@ public sealed class CliIntegrationTests
         var result = await CliTestHarness.RunCliAsync("diff", "--detailed-exit-code", "--rewriter", rewriterPath, "--file", targetPath);
 
         Assert.Equal(1, result.ExitCode);
-        Assert.True(result.StandardOutput.Contains("\"HasChanges\": false", StringComparison.Ordinal), result.FormatForAssertion());
+        var diff = CliTestHarness.ParseDiffResult(result.StandardOutput);
+        Assert.Empty(diff.FileResults);
     }
 
     [Fact]
@@ -251,4 +252,67 @@ public sealed class CliIntegrationTests
         // Non-convergent, but the last round's best-effort output (round 3 lands on "A") is still written.
         Assert.Contains("public void A()", await File.ReadAllTextAsync(targetPath));
     }
+
+    // -----------------------------------------------------------------------
+    // Multi-rewriter pipeline: per-stage (not per-file) processing
+    // -----------------------------------------------------------------------
+
+    [Fact]
+    public async Task Apply_pipeline_lets_stage_one_change_be_visible_to_stage_two_in_the_same_pass()
+    {
+        // Stage 1 (RenameHelper) renames Helper.M -> Ready in Helper.cs.
+        // Stage 2 (ConfirmWhenReady) renames Consumer.M -> Confirmed in Consumer.cs, but ONLY if it
+        // can see Helper.Ready via the semantic model. Under per-stage processing, stage 1's edit
+        // is folded into the Solution before stage 2 runs, so stage 2 sees Helper.Ready in a single
+        // pass — no --repeat-until-stable needed.
+        await using var workspace = CliTestWorkspace.Create();
+        var projectPath = await workspace.WriteProjectAsync("ProjectUnderTest");
+        var helperPath = await workspace.WriteFileAsync("ProjectUnderTest/Helper.cs", "public class Helper { public void M() { } }\n");
+        var consumerPath = await workspace.WriteFileAsync("ProjectUnderTest/Consumer.cs", "public class Consumer { public void M() { } }\n");
+        var rewriterPath = await workspace.WriteFileAsync("PipelineRewriters.cs", """
+            using System.Linq;
+            using Microsoft.CodeAnalysis;
+            using Microsoft.CodeAnalysis.CSharp;
+            using Microsoft.CodeAnalysis.CSharp.Syntax;
+            using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
+
+            public sealed class RenameHelper : CSharpSyntaxRewriter {
+                public override SyntaxNode? VisitMethodDeclaration(MethodDeclarationSyntax node) {
+                    var containingClass = node.Parent as ClassDeclarationSyntax;
+                    return containingClass?.Identifier.ValueText == "Helper" && node.Identifier.ValueText == "M"
+                        ? node.WithIdentifier(Identifier("Ready"))
+                        : base.VisitMethodDeclaration(node);
+                }
+            }
+
+            public sealed class ConfirmWhenReady : CSharpSyntaxRewriter {
+                private readonly SemanticModel semanticModel;
+                public ConfirmWhenReady(SemanticModel semanticModel) => this.semanticModel = semanticModel;
+
+                public override SyntaxNode? VisitMethodDeclaration(MethodDeclarationSyntax node) {
+                    var containingClass = node.Parent as ClassDeclarationSyntax;
+                    if (containingClass?.Identifier.ValueText == "Consumer" && node.Identifier.ValueText == "M") {
+                        var helperType = semanticModel.Compilation.GetTypeByMetadataName("Helper");
+                        var isReady = helperType?.GetMembers("Ready").Any() == true;
+                        return isReady ? node.WithIdentifier(Identifier("Confirmed")) : base.VisitMethodDeclaration(node);
+                    }
+                    return base.VisitMethodDeclaration(node);
+                }
+            }
+            """);
+
+        await workspace.RestoreAsync(projectPath);
+
+        var result = await CliTestHarness.RunCliAsync(
+            "apply",
+            "--rewriter", rewriterPath,
+            "--type", "RenameHelper",
+            "--type", "ConfirmWhenReady",
+            "--project", projectPath);
+
+        Assert.True(result.ExitCode == 0, result.FormatForAssertion());
+        Assert.Contains("Ready", await File.ReadAllTextAsync(helperPath));
+        Assert.Contains("Confirmed", await File.ReadAllTextAsync(consumerPath));
+    }
+
 }
