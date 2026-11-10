@@ -1,11 +1,28 @@
 ﻿using System.CommandLine;
 using System.CommandLine.Invocation;
+using System.Diagnostics;
 using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.MSBuild;
 using RoslynPad.Core;
 
-var rootCommand = new RootCommand("RoslynPad CLI");
+var rootCommand = new RootCommand("""
+    RoslynPad applies user-provided C# syntax rewriters to source files, projects, or solutions.
+    Rewriters are compiled from .cs files or loaded from .dll files. By default, all top-level
+    rewriter classes in source files run in declaration order; repeated --type options instead
+    define the ordered pipeline, and are required when loading a .dll.
+
+    Use "diff" to compute a preview without changing files. It writes JSON to stdout containing
+    changed file paths and their old and new text. Use "apply" to run the rewrite and write
+    changed files to disk; it reruns the pipeline rather than consuming a previous diff. For a
+    safe workflow, run diff, review the output, then apply with the same inputs and unchanged
+    target files. Specify exactly one target with --file, --project, or --solution. Project and
+    solution targets include C# documents and exclude bin and obj directories.
+
+    The pipeline can be repeated with --repeat-until-stable until a round makes no changes or
+    --max-iterations is reached. Each invocation is independent; Roslyn context and shared
+    run-scoped state can be provided to rewriter constructors.
+    """);
 
 var rewriterOption = new Option<string[]>("--rewriter")
 {
@@ -50,6 +67,11 @@ var maxIterationsOption = new Option<int>("--max-iterations")
     Description = "Caps the number of --repeat-until-stable rounds. Only meaningful alongside --repeat-until-stable. Defaults to 10."
 };
 maxIterationsOption.SetDefaultValue(10);
+
+var waitForDebuggerOption = new Option<bool>("--wait-for-debugger")
+{
+    Description = "Block until a debugger (e.g. Visual Studio) is attached to this process, then continue. Source-compiled rewriters are also emitted with a portable PDB so source-level breakpoints bind."
+};
 
 static async Task<ResolvedTarget> ResolveTargetAsync(string? filePath, string? projectPath, string? solutionPath, CancellationToken cancellationToken)
 {
@@ -117,10 +139,11 @@ static async Task<RewriteResult> RunAsync(
     string? projectPath,
     string? solutionPath,
     bool repeatUntilStable,
-    int maxIterations)
+    int maxIterations,
+    bool emitDebugSymbols)
 {
     var engine = new RewriteEngine();
-    var request = new RewriteRequest(rewriterPaths, rewriterTypes, repeatUntilStable, maxIterations);
+    var request = new RewriteRequest(rewriterPaths, rewriterTypes, repeatUntilStable, maxIterations, emitDebugSymbols);
     var resolved = await ResolveTargetAsync(filePath, projectPath, solutionPath, CancellationToken.None);
     try
     {
@@ -143,11 +166,12 @@ static async Task<int> RunWithExitCodeAsync(
     string? solutionPath,
     bool repeatUntilStable,
     int maxIterations,
+    bool emitDebugSymbols,
     Func<RewriteResult, Task> onSuccessAsync)
 {
     try
     {
-        var result = await RunAsync(rewriterPaths, rewriterTypes, filePath, projectPath, solutionPath, repeatUntilStable, maxIterations);
+        var result = await RunAsync(rewriterPaths, rewriterTypes, filePath, projectPath, solutionPath, repeatUntilStable, maxIterations, emitDebugSymbols);
         await onSuccessAsync(result);
 
         if (repeatUntilStable && !result.Converged)
@@ -173,6 +197,7 @@ diffCommand.AddOption(solutionOption);
 diffCommand.AddOption(detailedExitCodeOption);
 diffCommand.AddOption(repeatUntilStableOption);
 diffCommand.AddOption(maxIterationsOption);
+diffCommand.AddOption(waitForDebuggerOption);
 
 diffCommand.SetHandler(async (InvocationContext context) =>
 {
@@ -184,17 +209,27 @@ diffCommand.SetHandler(async (InvocationContext context) =>
     var targetSolution = context.ParseResult.GetValueForOption(solutionOption);
     var repeatUntilStable = context.ParseResult.GetValueForOption(repeatUntilStableOption);
     var maxIterations = context.ParseResult.GetValueForOption(maxIterationsOption);
+    var waitForDebugger = context.ParseResult.GetValueForOption(waitForDebuggerOption);
 
-    var exitCode = await RunWithExitCodeAsync(detailedExitCode, rewriterPaths, rewriterTypes, targetFile, targetProject, targetSolution, repeatUntilStable, maxIterations, async result =>
+    if (waitForDebugger)
     {
-        Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(result, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+        WaitForDebugger();
+    }
+
+    var exitCode = await RunWithExitCodeAsync(detailedExitCode, rewriterPaths, rewriterTypes, targetFile, targetProject, targetSolution, repeatUntilStable, maxIterations, waitForDebugger, async result =>
+    {
+        var jsonResult = new RewriteResult(
+            result.FileResults.Where(static fileResult => fileResult.HasChanges).ToList(),
+            result.Converged,
+            result.Iterations);
+        Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(jsonResult, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
         await Task.CompletedTask;
     });
 
     context.ExitCode = exitCode;
 });
 
-var applyCommand = new Command("apply", "Apply the rewrite result to the target file");
+var applyCommand = new Command("apply", "Run the rewrite pipeline and write changed files to the selected target");
 applyCommand.AddOption(rewriterOption);
 applyCommand.AddOption(typeOption);
 applyCommand.AddOption(fileOption);
@@ -203,6 +238,7 @@ applyCommand.AddOption(solutionOption);
 applyCommand.AddOption(detailedExitCodeOption);
 applyCommand.AddOption(repeatUntilStableOption);
 applyCommand.AddOption(maxIterationsOption);
+applyCommand.AddOption(waitForDebuggerOption);
 
 applyCommand.SetHandler(async (InvocationContext context) =>
 {
@@ -214,8 +250,14 @@ applyCommand.SetHandler(async (InvocationContext context) =>
     var targetSolution = context.ParseResult.GetValueForOption(solutionOption);
     var repeatUntilStable = context.ParseResult.GetValueForOption(repeatUntilStableOption);
     var maxIterations = context.ParseResult.GetValueForOption(maxIterationsOption);
+    var waitForDebugger = context.ParseResult.GetValueForOption(waitForDebuggerOption);
 
-    var exitCode = await RunWithExitCodeAsync(detailedExitCode, rewriterPaths, rewriterTypes, targetFile, targetProject, targetSolution, repeatUntilStable, maxIterations, async result =>
+    if (waitForDebugger)
+    {
+        WaitForDebugger();
+    }
+
+    var exitCode = await RunWithExitCodeAsync(detailedExitCode, rewriterPaths, rewriterTypes, targetFile, targetProject, targetSolution, repeatUntilStable, maxIterations, waitForDebugger, async result =>
     {
         foreach (var fileResult in result.FileResults.Where(fileResult => fileResult.HasChanges))
         {
@@ -232,5 +274,20 @@ rootCommand.Add(diffCommand);
 rootCommand.Add(applyCommand);
 
 return await rootCommand.InvokeAsync(args);
+
+static void WaitForDebugger()
+{
+    if (Debugger.IsAttached)
+    {
+        return;
+    }
+
+    Console.Error.WriteLine($"Process {Environment.ProcessId} ({Environment.ProcessPath}) waiting for a debugger to attach...");
+    while (!Debugger.IsAttached)
+    {
+        Thread.Sleep(100);
+    }
+    Console.Error.WriteLine("Debugger attached; continuing.");
+}
 
 sealed record ResolvedTarget(string? LooseFilePath, Solution? Solution, IReadOnlyList<DocumentId> DocumentIds, MSBuildWorkspace? Workspace);
